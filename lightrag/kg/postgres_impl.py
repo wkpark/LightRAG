@@ -3023,14 +3023,11 @@ class PGVectorStorage(BaseVectorStorage):
 
         # Get current UTC time and convert to naive datetime for database storage
         current_time = datetime.datetime.now(timezone.utc).replace(tzinfo=None)
-        list_data = [
-            {
-                "__id__": k,
-                **{k1: v1 for k1, v1 in v.items()},
-            }
-            for k, v in data.items()
-        ]
-        contents = [v["content"] for v in data.values()]
+
+        # Prepare contents for batch embedding
+        data_items = list(data.items())
+        contents = [v["content"] for _, v in data_items]
+
         batches = [
             contents[i : i + self._max_batch_size]
             for i in range(0, len(contents), self._max_batch_size)
@@ -3038,29 +3035,29 @@ class PGVectorStorage(BaseVectorStorage):
 
         embedding_tasks = [self.embedding_func(batch) for batch in batches]
         embeddings_list = await asyncio.gather(*embedding_tasks)
-
         embeddings = np.concatenate(embeddings_list)
-        for i, d in enumerate(list_data):
-            d["__vector__"] = embeddings[i]
 
-        # Prepare batch values for executemany
+        # Pre-determine the correct helper method to avoid repeated namespace checks in the loop
+        if is_namespace(self.namespace, NameSpace.VECTOR_STORE_CHUNKS):
+            upsert_func = self._upsert_chunks
+        elif is_namespace(self.namespace, NameSpace.VECTOR_STORE_ENTITIES):
+            upsert_func = self._upsert_entities
+        elif is_namespace(self.namespace, NameSpace.VECTOR_STORE_RELATIONSHIPS):
+            upsert_func = self._upsert_relationships
+        else:
+            raise ValueError(f"{self.namespace} is not supported")
+
+        # Prepare batch values for executemany directly from embeddings and original data
         batch_values: list[tuple[Any, ...]] = []
         upsert_sql = None
 
-        for item in list_data:
-            if is_namespace(self.namespace, NameSpace.VECTOR_STORE_CHUNKS):
-                upsert_sql, values = self._upsert_chunks(item, current_time)
-            elif is_namespace(self.namespace, NameSpace.VECTOR_STORE_ENTITIES):
-                upsert_sql, values = self._upsert_entities(item, current_time)
-            elif is_namespace(self.namespace, NameSpace.VECTOR_STORE_RELATIONSHIPS):
-                upsert_sql, values = self._upsert_relationships(item, current_time)
-            else:
-                raise ValueError(f"{self.namespace} is not supported")
-
+        for i, (k, v) in enumerate(data_items):
+            # Inject vector and ID into a temporary item for the helper
+            item = {"__id__": k, "__vector__": embeddings[i], **v}
+            upsert_sql, values = upsert_func(item, current_time)
             batch_values.append(values)
 
         # Use executemany for batch execution - significantly reduces DB round-trips
-        # Note: register_vector is already called on pool init, no need to call it again
         if batch_values and upsert_sql:
 
             async def _batch_upsert(connection: asyncpg.Connection) -> None:
