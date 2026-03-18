@@ -331,15 +331,31 @@ class PostgreSQLDB:
         )
 
         async def _init_connection(connection: asyncpg.Connection) -> None:
-            """Initialize each connection with pgvector codec.
+            """Initialize each connection with pgvector codec and high-performance numpy binary codec.
 
             This callback is invoked by asyncpg for every new connection in the pool.
             Registering the vector codec here ensures ALL connections can properly
-            encode/decode vector columns, eliminating non-deterministic behavior
-            where some connections have the codec and others don't.
+            encode/decode vector columns using binary format for maximum performance.
             """
             if self.enable_vector:
                 await register_vector(connection)
+                # Register high-performance numpy binary codec for vector type
+                try:  # Register high-performance numpy binary codec for vector type
+                    await connection.set_type_codec(
+                        "vector",
+                        encoder=lambda v: np.asarray(v, dtype="<f4").tobytes(),
+                        decoder=lambda b: np.frombuffer(b, dtype="<f4"),
+                        format="binary",
+                        schema="public",
+                    )
+                except asyncpg.exceptions.InvalidParameterValueError as e:
+                    logger.warning(
+                        f"PostgreSQL, Failed to set binary codec due to invalid parameter: {e}"
+                    )
+                except Exception as e:
+                    logger.warning(
+                        f"PostgreSQL, Failed to set high-performance binary codec for vector: {e}"
+                    )
 
         async def _create_pool_once() -> None:
             # STEP 1: Bootstrap - ensure vector extension exists BEFORE pool creation.
@@ -3067,15 +3083,12 @@ class PGVectorStorage(BaseVectorStorage):
             )  # higher priority for query
             embedding = embeddings[0]
 
-        embedding_string = ",".join(map(str, embedding))
-
-        sql = SQL_TEMPLATES[self.namespace].format(
-            embedding_string=embedding_string, table_name=self.table_name
-        )
+        sql = SQL_TEMPLATES[self.namespace].format(table_name=self.table_name)
         params = {
             "workspace": self.workspace,
             "closer_than_threshold": 1 - self.cosine_better_than_threshold,
             "top_k": top_k,
+            "embedding": embedding,
         }
         results = await self.db.query(sql, params=list(params.values()), multirows=True)
         return results
@@ -5785,34 +5798,55 @@ SQL_TEMPLATES = {
                       update_time = EXCLUDED.update_time
                      """,
     "relationships": """
+                     WITH search_results AS (
+                         SELECT id, 1 - (content_vector <=> $4::vector) AS score
+                         FROM {table_name}
+                         WHERE workspace = $1
+                           AND content_vector <=> $4::vector < $2
+                         ORDER BY content_vector <=> $4::vector
+                         LIMIT $3
+                     )
                      SELECT r.source_id AS src_id,
                             r.target_id AS tgt_id,
-                            EXTRACT(EPOCH FROM r.create_time)::BIGINT AS created_at
-                     FROM {table_name} r
-                     WHERE r.workspace = $1
-                       AND r.content_vector <=> '[{embedding_string}]'::vector < $2
-                     ORDER BY r.content_vector <=> '[{embedding_string}]'::vector
-                     LIMIT $3;
+                            EXTRACT(EPOCH FROM r.create_time)::BIGINT AS created_at,
+                            sr.score
+                     FROM search_results sr
+                     JOIN {table_name} r ON sr.id = r.id
+                     ORDER BY sr.score DESC;
                      """,
     "entities": """
+                WITH search_results AS (
+                    SELECT id, 1 - (content_vector <=> $4::vector) AS score
+                    FROM {table_name}
+                    WHERE workspace = $1
+                      AND content_vector <=> $4::vector < $2
+                    ORDER BY content_vector <=> $4::vector
+                    LIMIT $3
+                )
                 SELECT e.entity_name,
-                       EXTRACT(EPOCH FROM e.create_time)::BIGINT AS created_at
-                FROM {table_name} e
-                WHERE e.workspace = $1
-                  AND e.content_vector <=> '[{embedding_string}]'::vector < $2
-                ORDER BY e.content_vector <=> '[{embedding_string}]'::vector
-                LIMIT $3;
+                       EXTRACT(EPOCH FROM e.create_time)::BIGINT AS created_at,
+                       sr.score
+                FROM search_results sr
+                JOIN {table_name} e ON sr.id = e.id
+                ORDER BY sr.score DESC;
                 """,
     "chunks": """
+              WITH search_results AS (
+                  SELECT id, 1 - (content_vector <=> $4::vector) AS score
+                  FROM {table_name}
+                  WHERE workspace = $1
+                    AND content_vector <=> $4::vector < $2
+                  ORDER BY content_vector <=> $4::vector
+                  LIMIT $3
+              )
               SELECT c.id,
                      c.content,
                      c.file_path,
-                     EXTRACT(EPOCH FROM c.create_time)::BIGINT AS created_at
-              FROM {table_name} c
-              WHERE c.workspace = $1
-                AND c.content_vector <=> '[{embedding_string}]'::vector < $2
-              ORDER BY c.content_vector <=> '[{embedding_string}]'::vector
-              LIMIT $3;
+                     EXTRACT(EPOCH FROM c.create_time)::BIGINT AS created_at,
+                     sr.score
+              FROM search_results sr
+              JOIN {table_name} c ON sr.id = c.id
+              ORDER BY sr.score DESC;
               """,
     # DROP tables
     "drop_specifiy_table_workspace": """
